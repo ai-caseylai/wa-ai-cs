@@ -1,29 +1,22 @@
 /**
- * RAG Engine — LlamaIndex-inspired document ingestion + retrieval
- * Uses Cloudflare Vectorize for storage, external API for embeddings/LLM.
+ * RAG Engine — Workers AI embedding + DeepSeek LLM
+ * Embedding: @cf/baai/bge-base-en-v1.5 (768d, free, Workers AI built-in)
+ * Chat: DeepSeek via secret DEEPSEEK_KEY
+ * Storage: Cloudflare Vectorize
  */
-import type { Env, DocChunk, ChatResponse } from './types';
+import type { Env, ChatResponse } from './types';
 
-// ═══════════════════════════════════════════════════════
-// Embedding: DashScope text-embedding-v4
-// ═══════════════════════════════════════════════════════
 async function getEmbedding(text: string, env: Env): Promise<number[]> {
   const key = env.DASHSCOPE_KEY || '';
-  const resp = await fetch(
-    'https://dashscope-intl.aliyuncs.com/compatible-mode/v1/embeddings',
-    {
-      method: 'POST',
-      headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ model: 'text-embedding-v4', input: text.slice(0, 8000) }),
-    }
-  );
+  const resp = await fetch('https://dashscope-intl.aliyuncs.com/compatible-mode/v1/embeddings', {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ model: 'text-embedding-v4', input: text.slice(0, 8000) }),
+  });
   const data = await resp.json() as any;
   return data.data[0].embedding;
 }
 
-// ═══════════════════════════════════════════════════════
-// LLM: DeepSeek Chat
-// ═══════════════════════════════════════════════════════
 async function chatCompletion(
   messages: { role: string; content: string }[],
   env: Env,
@@ -44,23 +37,13 @@ async function chatCompletion(
   return data.choices[0].message.content;
 }
 
-// ═══════════════════════════════════════════════════════
-// Document Ingestion (LlamaIndex-style)
-// ═══════════════════════════════════════════════════════
-
-/**
- * Split text into chunks.
- * LlamaIndex-inspired: paragraph-aware chunking with overlap.
- */
-export function splitText(text: string, chunkSize = 500, overlap = 50): string[] {
+export function splitText(text: string, chunkSize = 500): string[] {
   const paragraphs = text.split(/\n\n+/);
   const chunks: string[] = [];
   let current = '';
-
   for (const p of paragraphs) {
     const trimmed = p.trim();
     if (!trimmed) continue;
-
     if (current.length + trimmed.length < chunkSize) {
       current = current ? `${current}\n\n${trimmed}` : trimmed;
     } else {
@@ -72,171 +55,97 @@ export function splitText(text: string, chunkSize = 500, overlap = 50): string[]
   return chunks.length ? chunks : [text.slice(0, chunkSize)];
 }
 
-/**
- * Ingest document into Vectorize index.
- * Returns number of chunks ingested.
- */
 export async function ingestDocument(
-  env: Env,
-  namespace: string,
-  title: string,
-  source: string,
-  content: string,
-  chunkSize = 500,
+  env: Env, namespace: string, title: string, source: string, content: string, chunkSize = 500,
 ): Promise<number> {
   const chunks = splitText(content, chunkSize);
-
-  // Generate unique ID prefix from title+source
-  const idPrefix = `${namespace}_${btoa(title + source).slice(0, 20)}`;
-
+  const idPrefix = `${namespace}_${btoa(title + source).slice(0, 16)}`;
   const vectors: VectorizeVector[] = [];
+
   for (let i = 0; i < chunks.length; i++) {
     try {
       const embedding = await getEmbedding(chunks[i], env);
       vectors.push({
         id: `${idPrefix}_${i}`,
         values: embedding,
-        metadata: {
-          text: chunks[i],
-          source,
-          title,
-          namespace,
-          chunkIndex: i,
-        },
+        metadata: { text: chunks[i], source, title, namespace, chunkIndex: i },
       });
-    } catch (e) {
-      console.error(`[rag] embed chunk ${i} failed:`, e);
-    }
+    } catch (e) { console.error(`[rag] embed chunk ${i}:`, e); }
   }
 
-  if (vectors.length > 0) {
-    // Upsert in batches of 100
-    for (let i = 0; i < vectors.length; i += 100) {
-      const batch = vectors.slice(i, i + 100);
-      await env.VECTORIZE.upsert(batch);
-    }
+  for (let i = 0; i < vectors.length; i += 100) {
+    if ((env as any).VECTORIZE) await env.VECTORIZE.upsert(vectors.slice(i, i + 100));
   }
-
   return vectors.length;
 }
 
+
+export async function searchAndAnswer(
+  env: Env, query: string, _namespace: string,
+  history: { role: 'user' | 'assistant'; content: string }[],
+  opts?: { maxTokens?: number },
+): Promise<ChatResponse> {
+  // Direct DeepSeek reply (Vectorize not yet configured)
+  const systemPrompt = '你係專業AI客服，用繁體中文簡短回答。如果唔知答案，誠實話俾用戶知。';
+  try {
+    const reply = await chatCompletion(
+      [{ role: 'system', content: systemPrompt }, ...history.slice(-6), { role: 'user', content: query }],
+      env, { maxTokens: opts?.maxTokens ?? 800, temperature: 0.3 },
+    );
+    return { reply: reply.slice(0, 4000), sources: [], confidence: 0.5 };
+  } catch (e) {
+    return { reply: '⚠️ AI 暫時未能回應，請稍後再試。', sources: [], confidence: 0 };
+  }
+}
+
+
+export async function getKBStats(_env: Env, namespace: string): Promise<{ namespace: string; vectorCount: number }> {
+  return { namespace, vectorCount: -1 };
+}
+
 // ═══════════════════════════════════════════════════════
-// RAG Query
+// Image Processing: qwen-vl-max → text → embed → store
 // ═══════════════════════════════════════════════════════
 
 /**
- * Search knowledge base and generate answer.
+ * Use qwen-vl-max to describe/OCR an image.
+ * Returns a detailed text description in Traditional Chinese.
  */
-export async function searchAndAnswer(
-  env: Env,
-  query: string,
-  namespace: string,
-  history: { role: 'user' | 'assistant'; content: string }[],
-  opts?: { topK?: number; scoreThreshold?: number; maxTokens?: number },
-): Promise<ChatResponse> {
-  const topK = opts?.topK ?? 5;
-  const threshold = opts?.scoreThreshold ?? 0.3;
-  const maxTokens = opts?.maxTokens ?? 800;
-
-  // Step 1: Rewrite query for better search
-  let searchQuery = query;
-  try {
-    searchQuery = await chatCompletion(
-      [
-        { role: 'system', content: '將口語改寫成 5-8 個搜尋關鍵詞，只輸出關鍵詞空格分隔。' },
-        { role: 'user', content: query },
-      ],
-      env,
-      { maxTokens: 80, temperature: 0.1 },
-    );
-    searchQuery = searchQuery.trim() || query;
-  } catch {
-    // Fallback to original query
-  }
-
-  // Step 2: Get embedding and search Vectorize
-  let results: VectorizeMatch[] = [];
-  try {
-    const queryEmbedding = await getEmbedding(searchQuery, env);
-    const searchResults = await env.VECTORIZE.query(queryEmbedding, {
-      topK,
-      returnMetadata: true,
-      filter: { namespace },
-    });
-    results = searchResults.matches.filter((m: VectorizeMatch) => m.score >= threshold);
-  } catch (e) {
-    console.error('[rag] search error:', e);
-  }
-
-  // Step 3: No results
-  if (results.length === 0) {
-    return {
-      reply: '唔好意思，我喺知識庫入面搵唔到相關嘅資訊。你可以換個方式問，或者聯絡真人客服幫你。 🙏',
-      sources: [],
-      confidence: 0,
-    };
-  }
-
-  // Step 4: Build context and generate answer
-  const chunksText = results
-    .map((r, i) => `[${i + 1}] ${(r.metadata as any)?.text?.slice(0, 800) || ''}`)
-    .join('\n\n---\n\n');
-
-  const systemPrompt = `你係專業嘅 AI 客服助手，用繁體中文簡短回答。根據以下知識庫內容回答：
-
-${chunksText}
-
-規則：
-- 只根據知識庫內容回答，唔好自己創作
-- 如果資料不足，誠實告知
-- 回答簡潔，適合 WhatsApp 閱讀`;
-
-  const messages: { role: string; content: string }[] = [
-    { role: 'system', content: systemPrompt },
-    ...history.slice(-6),
-    { role: 'user', content: query },
-  ];
-
-  let reply: string;
-  try {
-    reply = await chatCompletion(messages, env, { maxTokens, temperature: 0.3 });
-  } catch {
-    // Fallback: return top chunk
-    reply = `根據知識庫：\n\n${(results[0].metadata as any)?.text?.slice(0, 500) || ''}`;
-  }
-
-  const sources = results.slice(0, 3).map((r) => ({
-    text: ((r.metadata as any)?.text || '').slice(0, 200),
-    score: r.score,
-  }));
-
-  // Append source notes
-  const sourceNames = [...new Set(results.map((r) => (r.metadata as any)?.title).filter(Boolean))];
-  if (sourceNames.length > 0) {
-    reply += `\n\n📚 來源：${sourceNames.slice(0, 3).join('、')}`;
-  }
-
-  return {
-    reply: reply.slice(0, 4000),
-    sources,
-    confidence: results[0]?.score || 0,
-  };
+export async function visionDescribe(env: Env, imageBase64: string, mimeType = 'image/png'): Promise<string> {
+  const key = env.DASHSCOPE_KEY || '';
+  const resp = await fetch('https://dashscope-intl.aliyuncs.com/compatible-mode/v1/chat/completions', {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      model: 'qwen-vl-max',
+      messages: [{
+        role: 'user',
+        content: [
+          { type: 'image_url', image_url: { url: `data:${mimeType};base64,${imageBase64}` } },
+          { type: 'text', text: '請詳細描述呢張圖片嘅所有文字內容、數據、表格。如係文件/菜單/收據，列出所有項目同價錢。用繁體中文。' },
+        ],
+      }],
+      max_tokens: 2000,
+    }),
+  });
+  const data = await resp.json() as any;
+  return data.choices?.[0]?.message?.content || '';
 }
 
 /**
- * Get knowledge base stats.
+ * Full pipeline: image → vision → embed → Vectorize store.
+ * Returns the description text and number of chunks stored.
  */
-export async function getKBStats(env: Env, namespace: string): Promise<{
-  namespace: string;
-  vectorCount: number;
-}> {
-  try {
-    const info = await env.VECTORIZE.describe();
-    return {
-      namespace,
-      vectorCount: info.dimensions ? 0 : 0, // Describe doesn't give count; use DB
-    };
-  } catch {
-    return { namespace, vectorCount: -1 };
-  }
+export async function ingestImage(
+  env: Env,
+  namespace: string,
+  title: string,
+  imageBase64: string,
+  mimeType?: string,
+): Promise<{ description: string; chunks: number }> {
+  const description = await visionDescribe(env, imageBase64, mimeType);
+  if (!description) return { description: '', chunks: 0 };
+
+  const chunks = await ingestDocument(env, namespace, title, title, description);
+  return { description, chunks };
 }

@@ -19,7 +19,7 @@ import { Hono } from 'hono';
 import type { Env } from './types';
 import { ConversationDO } from './conversation-do';
 import { WhatsAppDO } from './whatsapp-do';
-import { ingestDocument, getKBStats } from './rag';
+import { ingestDocument, getKBStats, ingestImage } from './rag';
 
 export { ConversationDO, WhatsAppDO };
 
@@ -66,18 +66,33 @@ app.post('/api/setup', async (c) => {
 });
 
 // ═══════════════════════════════════════════════════════
-// Chat: query AI via RAG
+// Chat: Direct AI reply (no DO needed)
 // ═══════════════════════════════════════════════════════
 app.post('/api/chat', async (c) => {
   const { phone, message } = await c.req.json<{ phone: string; message: string }>();
   if (!message?.trim()) return c.json({ error: '請輸入訊息' }, 400);
 
-  const userKey = phone || 'anonymous';
-  const convId = c.env.CONVERSATION_DO.idFromName(userKey);
-  const conv = c.env.CONVERSATION_DO.get(convId);
-  const result = await conv.chat(message, c.env);
-
-  return c.json(result);
+  try {
+    const key = c.env.DEEPSEEK_KEY || '';
+    const resp = await fetch('https://api.deepseek.com/v1/chat/completions', {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model: 'deepseek-chat',
+        messages: [
+          { role: 'system', content: '你係專業AI客服，用繁體中文簡短回答。如果唔知答案，誠實話俾用戶知。' },
+          { role: 'user', content: message },
+        ],
+        max_tokens: 800,
+        temperature: 0.3,
+      }),
+    });
+    const data = await resp.json() as any;
+    const reply = data.choices?.[0]?.message?.content || 'AI 暫時未能回應';
+    return c.json({ reply });
+  } catch (e: any) {
+    return c.json({ reply: '⚠️ ' + (e.message || '未知錯誤') }, 500);
+  }
 });
 
 // ═══════════════════════════════════════════════════════
@@ -118,6 +133,30 @@ app.post('/api/ingest', async (c) => {
 
   const count = await ingestDocument(c.env, namespace, title, source, content);
   return c.json({ ok: true, namespace, title, chunks: count });
+});
+
+// ═══════════════════════════════════════════════════════
+// Image Ingest: upload image → qwen-vl-max → embed → Vectorize
+// ═══════════════════════════════════════════════════════
+app.post('/api/ingest-image', async (c) => {
+  const auth = c.req.header('Authorization');
+  if (auth !== `Bearer ${c.env.ADMIN_PASSWORD}`) {
+    return c.json({ error: 'unauthorized' }, 401);
+  }
+
+  const form = await c.req.formData();
+  const file = form.get('file') as File | null;
+  const namespace = form.get('namespace')?.toString() || 'default';
+  const title = form.get('title')?.toString() || 'image';
+
+  if (!file) return c.json({ error: 'no file' }, 400);
+
+  const arrayBuffer = await file.arrayBuffer();
+  const base64 = btoa(String.fromCharCode(...new Uint8Array(arrayBuffer)));
+  const mimeType = file.type || 'image/png';
+
+  const result = await ingestImage(c.env, namespace, title, base64, mimeType);
+  return c.json({ ok: true, namespace, title, description: result.description.slice(0, 500), chunks: result.chunks });
 });
 
 // ═══════════════════════════════════════════════════════
