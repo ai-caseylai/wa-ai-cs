@@ -194,31 +194,56 @@ ${candidateText}
 // ═══════════════════════════════════════════════════════
 
 /**
- * Expand query for trilingual search.
- * Adds translations/variants to improve recall.
+ * 粵語優化 Query Expansion (LlamaIndex-style)
+ * 
+ * 策略：
+ *   粵語輸入 → ①原文 + ②書面語正規化 + ③英文翻譯 → 3個 queries
+ *   英文輸入 → ①原文 + ②繁體翻譯 + ③簡體翻譯 → 3個 queries
+ *   繁體輸入 → ①原文 + ②廣東話轉換 + ③英文 → 3個 queries
+ * 
+ * 多個 query 分別做 embedding search，結果用 RRF 融合。
  */
 async function expandQuery(query: string, env: Env): Promise<string[]> {
   const lang = detectLang(query);
-  const queries = [query];
+  const queries = [query]; // 原文 always included
 
-  try {
-    const prompt = `將以下問題改寫成 3 個不同表達方式（廣東話口語、繁體書面語、英文），用 | 分隔：
-${query}
-改寫（廣東話|繁體|英文）：`;
-    const result = await chatCompletion(
-      [{ role: 'user', content: prompt }],
-      env,
-      { maxTokens: 150, temperature: 0.1 },
-    );
-    const variants = result.split('|').map(s => s.trim()).filter(s => s.length > 2);
-    for (const v of variants) {
-      if (!queries.includes(v)) queries.push(v);
-    }
-  } catch {
-    // Fallback: just use original query
+  if (lang === 'yue') {
+    // 粵語 → 正規化為書面語（最重要！提升 embedding 準確度）
+    const normalized = await normalizeCantonese(query, env);
+    if (normalized !== query) queries.push(normalized);
+    // 也加入英文翻譯
+    try {
+      const en = await chatCompletion(
+        [{ role: 'user', content: `Translate to English (just the translation): ${query}` }],
+        env, { maxTokens: 100, temperature: 0.1 },
+      );
+      if (en.trim() && !queries.includes(en.trim())) queries.push(en.trim());
+    } catch {}
+  } else if (lang === 'en') {
+    try {
+      const zh = await chatCompletion(
+        [{ role: 'user', content: `Translate to Traditional Chinese (just the translation): ${query}` }],
+        env, { maxTokens: 100, temperature: 0.1 },
+      );
+      if (zh.trim()) queries.push(zh.trim());
+      const simp = await chatCompletion(
+        [{ role: 'user', content: `Translate to Simplified Chinese (just the translation): ${query}` }],
+        env, { maxTokens: 100, temperature: 0.1 },
+      );
+      if (simp.trim() && simp !== zh.trim()) queries.push(simp.trim());
+    } catch {}
+  } else {
+    // 繁中/簡中 → 加上英文
+    try {
+      const en = await chatCompletion(
+        [{ role: 'user', content: `Translate to English (just the translation): ${query}` }],
+        env, { maxTokens: 100, temperature: 0.1 },
+      );
+      if (en.trim()) queries.push(en.trim());
+    } catch {}
   }
 
-  return queries.slice(0, 4);
+  return queries.slice(0, 5);
 }
 
 // ═══════════════════════════════════════════════════════
@@ -239,33 +264,60 @@ export async function searchAndAnswer(
   // Step 1: Expand query for trilingual search
   const queries = await expandQuery(query, env);
 
-  // Step 2: Run hybrid search (BM25 + Vector for each query variant)
-  const allResults: ScoredDoc[] = [];
-  const bm25Results: ScoredDoc[] = [];
-  const vectorResults: ScoredDoc[] = [];
+  // Step 2: Multi-query Vector Search (每個 query variant 獨立搜尋)
+  const allVectorResults: ScoredDoc[][] = [];
 
-  // Collect all documents for BM25 (from Vectorize metadata or local store)
-  // For now, use vector search as primary; BM25 as secondary when available
-  try {
-    const queryEmbedding = await getEmbedding(queries[0], env);
-    if ((env as any).VECTORIZE) {
-      const sr = await (env as any).VECTORIZE.query(queryEmbedding, {
-        topK: topK * 3,
-        returnMetadata: true,
-        filter: { namespace },
-      });
-      for (const m of sr.matches) {
-        vectorResults.push({
-          text: m.metadata?.text || '',
-          source: m.metadata?.source || '',
-          title: m.metadata?.title || '',
-          score: m.score,
+  for (const q of queries.slice(0, 3)) { // 最多 3 個 variant
+    try {
+      const queryEmbedding = await getEmbedding(q, env);
+      if ((env as any).VECTORIZE) {
+        const sr = await (env as any).VECTORIZE.query(queryEmbedding, {
+          topK: topK * 2,
+          returnMetadata: true,
+          filter: { namespace },
         });
+        const results: ScoredDoc[] = [];
+        for (const m of sr.matches) {
+          if (m.metadata?.text) {
+            results.push({
+              text: m.metadata.text,
+              source: m.metadata.source || '',
+              title: m.metadata.title || '',
+              score: m.score,
+            });
+          }
+        }
+        if (results.length > 0) allVectorResults.push(results);
+      }
+    } catch (e) {
+      console.error(`[rag] vector search for "${q.slice(0, 30)}":`, e);
+    }
+  }
+
+  // BM25 search on all collected docs (if available)
+  const bm25Results: ScoredDoc[] = [];
+  const allDocs = [...new Set(allVectorResults.flat().map(r => r.text))];
+  if (allDocs.length > 0) {
+    const avgLen = allDocs.reduce((s, d) => s + d.length, 0) / allDocs.length;
+    for (const doc of allDocs) {
+      let maxScore = 0;
+      for (const q of queries.slice(0, 2)) {
+        const s = bm25Score(q, doc, avgLen);
+        if (s > maxScore) maxScore = s;
+      }
+      if (maxScore > 0) {
+        bm25Results.push({ text: doc, source: '', title: '', score: maxScore });
       }
     }
-  } catch (e) {
-    console.error('[rag] vector search:', e);
+    bm25Results.sort((a, b) => b.score - a.score);
   }
+
+  // RRF Fusion: BM25 + all vector query results
+  const allRankLists = [bm25Results.slice(0, topK * 3)];
+  for (const vr of allVectorResults) {
+    allRankLists.push(vr.slice(0, topK * 3));
+  }
+  const vectorResults = rrf(allRankLists);
 
   // Filter empty results
   const validResults = vectorResults.filter(r => r.text);
