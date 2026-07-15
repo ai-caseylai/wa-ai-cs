@@ -64,25 +64,45 @@ async function chatCompletion(
   const cfg = getModelConfig(p, env);
   if (!cfg.key) return '';
 
-  const resp = await fetch(`${cfg.base}/chat/completions`, {
-    method: 'POST',
-    headers: { Authorization: `Bearer ${cfg.key}`, 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      model: cfg.model,
-      messages,
-      max_tokens: opts?.maxTokens ?? 800,
-      temperature: opts?.temperature ?? 0.3,
-    }),
-  });
-  const data = await resp.json() as any;
-  const err = data.error;
-  if (err) {
-    console.error(`[llm:${p}] ${err.code}: ${err.message}`);
-    // Fallback to DeepSeek
-    if (p !== 'deepseek') return chatCompletion(messages, env, { ...opts, provider: 'deepseek' });
-    throw new Error(err.message || 'LLM error');
+  // GLM needs higher max_tokens (reasoning uses tokens too)
+  const actualMaxTokens = p === 'glm' 
+    ? Math.max(opts?.maxTokens ?? 800, 2000)  // GLM: at least 2000
+    : (opts?.maxTokens ?? 800);
+
+  try {
+    const resp = await fetch(`${cfg.base}/chat/completions`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${cfg.key}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model: cfg.model,
+        messages,
+        max_tokens: actualMaxTokens,
+        temperature: opts?.temperature ?? 0.3,
+      }),
+    });
+    const data = await resp.json() as any;
+    const err = data.error;
+    if (err) {
+      console.error(`[llm:${p}] ${err.code}: ${err.message}`);
+      // Fallback chain: GLM → Qwen → DeepSeek
+      if (p === 'glm') return chatCompletion(messages, env, { ...opts, provider: 'qwen' });
+      if (p === 'qwen') return chatCompletion(messages, env, { ...opts, provider: 'deepseek' });
+      throw new Error(err.message || 'LLM error');
+    }
+    
+    // GLM sometimes returns reasoning_content only, extract actual content
+    let content = data.choices[0].message.content;
+    if (!content && data.choices[0].message.reasoning_content) {
+      // Use reasoning as fallback content
+      content = data.choices[0].message.reasoning_content.slice(-500);
+    }
+    return content || '';
+  } catch (e: any) {
+    console.error(`[llm:${p}] fetch error:`, e.message);
+    if (p === 'glm') return chatCompletion(messages, env, { ...opts, provider: 'qwen' });
+    if (p === 'qwen') return chatCompletion(messages, env, { ...opts, provider: 'deepseek' });
+    throw e;
   }
-  return data.choices[0].message.content;
 }
 
 // ═══════════════════════════════════════════════════════
