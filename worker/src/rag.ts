@@ -25,25 +25,63 @@ async function getEmbedding(text: string, env: Env): Promise<number[]> {
 }
 
 // ═══════════════════════════════════════════════════════
-// 2. LLM: DeepSeek Chat
+// 2. Multi-Model LLM (DeepSeek / Qwen / GLM)
 // ═══════════════════════════════════════════════════════
+
+type ModelProvider = 'deepseek' | 'qwen' | 'glm';
+
+interface ModelConfig {
+  base: string;
+  key: string;
+  model: string;
+}
+
+function getModelConfig(provider: ModelProvider, env: Env): ModelConfig {
+  switch (provider) {
+    case 'qwen':
+      return { base: 'https://dashscope-intl.aliyuncs.com/compatible-mode/v1', key: env.DASHSCOPE_KEY || '', model: 'qwen3-max' };
+    case 'glm':
+      return { base: 'https://api.z.ai/api/paas/v4', key: env.GLM_KEY || '', model: 'glm-5.2' };
+    default:
+      return { base: 'https://api.deepseek.com/v1', key: env.DEEPSEEK_KEY || '', model: 'deepseek-chat' };
+  }
+}
+
+/**
+ * Chat completion with model selection.
+ * 
+ * 策略：
+ *   - Re-rank → DeepSeek (最快、最準)
+ *   - 粵語生成 → Qwen (最地道)
+ *   - 預設 → DeepSeek (最穩定)
+ */
 async function chatCompletion(
   messages: { role: string; content: string }[],
   env: Env,
-  opts?: { maxTokens?: number; temperature?: number },
+  opts?: { maxTokens?: number; temperature?: number; provider?: ModelProvider },
 ): Promise<string> {
-  const key = env.DEEPSEEK_KEY || '';
-  const resp = await fetch('https://api.deepseek.com/v1/chat/completions', {
+  const p = opts?.provider || 'deepseek';
+  const cfg = getModelConfig(p, env);
+  if (!cfg.key) return '';
+
+  const resp = await fetch(`${cfg.base}/chat/completions`, {
     method: 'POST',
-    headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json' },
+    headers: { Authorization: `Bearer ${cfg.key}`, 'Content-Type': 'application/json' },
     body: JSON.stringify({
-      model: 'deepseek-chat',
+      model: cfg.model,
       messages,
       max_tokens: opts?.maxTokens ?? 800,
       temperature: opts?.temperature ?? 0.3,
     }),
   });
   const data = await resp.json() as any;
+  const err = data.error;
+  if (err) {
+    console.error(`[llm:${p}] ${err.code}: ${err.message}`);
+    // Fallback to DeepSeek
+    if (p !== 'deepseek') return chatCompletion(messages, env, { ...opts, provider: 'deepseek' });
+    throw new Error(err.message || 'LLM error');
+  }
   return data.choices[0].message.content;
 }
 
@@ -172,7 +210,7 @@ ${candidateText}
     const result = await chatCompletion(
       [{ role: 'user', content: prompt }],
       env,
-      { maxTokens: 50, temperature: 0 },
+      { maxTokens: 50, temperature: 0, provider: 'deepseek' },
     );
     const indices = result.match(/\d+/g)?.map(Number) || [];
     const reranked = indices
@@ -364,6 +402,9 @@ ${chunksText}
 - 嚴格使用${langLabel}，不要混雜其他語言
 - 如果有餐牌/價錢資料，原文照錄，不要擅自改動`;
 
+  // 選模型：粵語用 Qwen（更地道），其他用 DeepSeek
+  const chatProvider: ModelProvider = userLang === 'yue' ? 'qwen' : 'deepseek';
+  
   let reply: string;
   try {
     reply = await chatCompletion(
@@ -373,9 +414,10 @@ ${chunksText}
         { role: 'user', content: query },
       ],
       env,
-      { maxTokens, temperature: 0.3 },
+      { maxTokens, temperature: 0.3, provider: chatProvider },
     );
-  } catch {
+  } catch (e) {
+    console.error('[rag] chat error:', e);
     reply = finalResults[0]?.text?.slice(0, 500) || '暫時未能回應';
   }
 
