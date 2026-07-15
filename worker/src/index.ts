@@ -26,6 +26,22 @@ export { ConversationDO, WhatsAppDO, SessionDO };
 
 const app = new Hono<{ Bindings: Env }>();
 
+// CORS + Error handling middleware
+app.use('*', async (c, next) => {
+  c.header('Access-Control-Allow-Origin', '*');
+  c.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+  c.header('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+  if (c.req.method === 'OPTIONS') return c.text('', 204);
+  try {
+    await next();
+  } catch (e: any) {
+    console.error('[error]', e.message);
+    c.status(500);
+    return c.json({ error: e.message || 'Internal error' });
+  }
+  return;
+});
+
 // ═══════════════════════════════════════════════════════
 // Onboarding Web UI
 // ═══════════════════════════════════════════════════════
@@ -45,7 +61,7 @@ app.get('/api/health', (c) => c.json({
 // ═══════════════════════════════════════════════════════
 app.post('/api/setup', async (c) => {
   const { phone } = await c.req.json<{ phone: string }>();
-  if (!phone || !/^\d{7,15}$/.test(phone)) {
+  if (!phone || !/^[0-9]{7,15}$/.test(phone)) {
     return c.json({ error: '請輸入正確電話號碼' }, 400);
   }
 
@@ -385,12 +401,13 @@ h1{font-size:1.6rem;font-weight:700;background:linear-gradient(135deg,#f6821f,#f
     <button class="btn btn-go" id="btnSetup" onclick="doSetup()">📱 取得驗證碼</button>
   </div>
   <div class="status hidden" id="setupStatus"></div>
-  <div id="codeBox" class="hidden" style="width:100%;background:#0a1a0a;border-radius:12px;padding:20px;text-align:center;margin:8px 0;border:1px solid #25D366">
-    <p style="color:#888;font-size:.8rem;margin-bottom:8px">請發送以下驗證碼到 WhatsApp</p>
-    <div style="font-size:2.5rem;font-weight:900;letter-spacing:8px;color:#25D366;font-family:monospace" id="codeDisplay">------</div>
-    <p style="color:#888;font-size:.8rem;margin-top:8px">發送到 <b style="color:#25D366" id="ownerDisplay">+852 9718 8675</b></p>
-    <div class="status wait" id="verifyStatus" style="margin-top:8px">⏳ 等待驗證中...</div>
+  <div id="codeBox" class="hidden" style="width:100%;background:#0a1a0a;border-radius:12px;padding:16px;text-align:center;border:1px solid #25D366">
+    <p style="color:#888;font-size:.8rem;margin-bottom:6px">請發送以下驗證碼到 WhatsApp</p>
+    <div style="font-size:2.2rem;font-weight:900;letter-spacing:6px;color:#25D366;font-family:monospace" id="codeDisplay">------</div>
+    <p style="color:#888;font-size:.8rem;margin-top:6px">發送到 <b style="color:#25D366" id="ownerDisplay">+852 9718 8675</b></p>
+    <div class="status wait" id="verifyStatus">⏳ 等待驗證中...</div>
   </div>
+
 
   <div id="uploadSection" class="hidden upload">
     <div class="upload-zone" onclick="document.getElementById('fileInput').click()">📄 上載 PDF</div>
@@ -429,20 +446,42 @@ function esc(s) { return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').re
 
 async function doSetup() {
   const p = document.getElementById('phone').value.trim();
-  if (!p || !/^\\d{7,15}$/.test(p)) return alert('請輸入正確號碼');
+  if (!p || !/^[0-9]{7,15}$/.test(p)) return alert('請輸入正確號碼');
   const s = document.getElementById('setupStatus');
-  s.className='status wait'; s.classList.remove('hidden'); s.textContent='⏳ 設定中...';
+  s.className='status wait'; s.classList.remove('hidden'); s.textContent='⏳ 生成驗證碼...';
   try {
-    const r = await (await fetch('/api/setup',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({phone:p})})).json();
+    const r = await (await fetch('/api/verify',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'generate',phone:p})})).json();
     if (r.error) { s.className='status err'; s.textContent='❌ '+r.error; return; }
-    phone = p; localStorage.setItem('wa_phone',p); localStorage.setItem('wa_setup','true');
-    s.className='status ok'; s.textContent='✅ 已連接！';
-    document.getElementById('btnSetup').textContent='✅ 已設定'; document.getElementById('btnSetup').disabled=true;
-    document.getElementById('simStatus').textContent='在線 — '+p;
-    showUpload();
+    phone = p; sessionId = r.session_id;
+    localStorage.setItem('wa_phone',p); localStorage.setItem('wa_session',sessionId);
+    s.className='status ok'; s.textContent='✅ 驗證碼已生成';
+    document.getElementById('btnSetup').textContent='✅ 已生成'; document.getElementById('btnSetup').disabled=true;
+    document.getElementById('codeBox').classList.remove('hidden');
+    document.getElementById('codeDisplay').textContent = r.code;
+    document.getElementById('ownerDisplay').textContent = '+'+r.owner_phone.replace(/(\d{3})(\d{4})(\d{4})/,'$1 $2 $3');
+    document.getElementById('simStatus').textContent='等待驗證';
+    pollVerify();
   } catch(e) { s.className='status err'; s.textContent='❌ '+e.message; }
 }
 
+async function pollVerify() {
+  const check = async () => {
+    try {
+      const r = await (await fetch('/api/verify',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'check',session_id:sessionId})})).json();
+      if (r.verified) {
+        localStorage.setItem('wa_setup','true');
+        document.getElementById('verifyStatus').className='status ok';
+        document.getElementById('verifyStatus').textContent='✅ 驗證成功！AI 客服已啟動';
+        document.getElementById('simStatus').textContent='在線 — '+phone;
+        showUpload();
+        return;
+      }
+      document.getElementById('verifyStatus').textContent='⏳ 等待驗證中...';
+      setTimeout(check, 2000);
+    } catch(e) { setTimeout(check, 3000); }
+  };
+  setTimeout(check, 2000);
+}
 let fileToUpload = null;
 function handleFile(fl) {
   if (fl.length > 0) { fileToUpload = fl[0]; document.getElementById('btnIngest').disabled = false; }
