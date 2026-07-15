@@ -15,37 +15,9 @@
     { "tag": "v1", "new_classes": ["WhatsAppDO", "ConversationDO"] }
   ],
 
-  "vectorize": [
-    {
-      "binding": "VECTORIZE",
-      "index_name": "wa-ai-cs-kb"
-    }
-  ],
-
-  "d1_databases": [
-    {
-      "binding": "DB",
-      "database_name": "wa-ai-cs-db",
-      "database_id": "PLACEHOLDER"
-    }
-  ],
-
-  "r2_buckets": [
-    {
-      "binding": "MEDIA_BUCKET",
-      "bucket_name": "wa-ai-cs-media"
-    }
-  ],
-
   "vars": {
-    "ADMIN_PASSWORD": "changeme",
-    "DEEPSEEK_API_KEY": "",
-    "DASHSCOPE_API_KEY": ""
+    "ADMIN_PASSWORD": "changeme"
   },
-
-  "routes": [
-    { "pattern": "wa-ai-cs.YOUR-SUBDOMAIN.workers.dev", "custom_domain": true }
-  ],
 
   "observability": {
     "enabled": true,

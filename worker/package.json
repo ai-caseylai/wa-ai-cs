@@ -5,13 +5,10 @@
   "type": "module",
   "scripts": {
     "deploy": "wrangler deploy",
-    "dev": "wrangler dev",
-    "cf-typegen": "wrangler types"
+    "dev": "wrangler dev"
   },
   "dependencies": {
-    "@whiskeysockets/baileys": "^7.0.0",
-    "hono": "^4.0.0",
-    "pino": "^9.0.0"
+    "hono": "^4.0.0"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^4.20250714.0",

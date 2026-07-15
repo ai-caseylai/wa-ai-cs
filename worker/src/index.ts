@@ -18,9 +18,10 @@
 import { Hono } from 'hono';
 import type { Env } from './types';
 import { ConversationDO } from './conversation-do';
+import { WhatsAppDO } from './whatsapp-do';
 import { ingestDocument, getKBStats } from './rag';
 
-export { ConversationDO };
+export { ConversationDO, WhatsAppDO };
 
 const app = new Hono<{ Bindings: Env }>();
 
