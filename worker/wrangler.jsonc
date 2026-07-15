@@ -1,0 +1,54 @@
+{
+  "$schema": "https://raw.githubusercontent.com/cloudflare/workers-sdk/main/packages/wrangler/config-schema.json",
+  "name": "wa-ai-cs",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-07-15",
+  "compatibility_flags": ["nodejs_compat"],
+  
+  "durable_objects": {
+    "bindings": [
+      { "name": "WHATSAPP_DO", "class_name": "WhatsAppDO" },
+      { "name": "CONVERSATION_DO", "class_name": "ConversationDO" }
+    ]
+  },
+  "migrations": [
+    { "tag": "v1", "new_classes": ["WhatsAppDO", "ConversationDO"] }
+  ],
+
+  "vectorize": [
+    {
+      "binding": "VECTORIZE",
+      "index_name": "wa-ai-cs-kb"
+    }
+  ],
+
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "wa-ai-cs-db",
+      "database_id": "PLACEHOLDER"
+    }
+  ],
+
+  "r2_buckets": [
+    {
+      "binding": "MEDIA_BUCKET",
+      "bucket_name": "wa-ai-cs-media"
+    }
+  ],
+
+  "vars": {
+    "ADMIN_PASSWORD": "changeme",
+    "DEEPSEEK_API_KEY": "",
+    "DASHSCOPE_API_KEY": ""
+  },
+
+  "routes": [
+    { "pattern": "wa-ai-cs.YOUR-SUBDOMAIN.workers.dev", "custom_domain": true }
+  ],
+
+  "observability": {
+    "enabled": true,
+    "head_sampling_rate": 1
+  }
+}
