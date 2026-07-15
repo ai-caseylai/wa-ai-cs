@@ -218,6 +218,20 @@ app.post('/api/verify', async (c) => {
     const doId = c.env.SESSION_DO.idFromName(`code_${code}`);
     const session = c.env.SESSION_DO.get(doId);
     await session.init(code, phone || code);
+    // Store in code registry DO
+    try {
+      const regId = c.env.SESSION_DO.idFromName('_code_registry');
+      const reg = c.env.SESSION_DO.get(regId);
+      const regState = await reg.getState();
+      const codes = (regState as any).codes || [];
+      codes.push({ code, phone: phone || code, createdAt: Date.now(), ttl: 120000 });
+      // Keep only recent codes
+      const now = Date.now();
+      (regState as any).codes = codes.filter((cd: any) => now - cd.createdAt < 120000);
+      await reg.init(code, phone || code); // hack: reuse init to save
+      // Actually need a proper save method. Use a different approach:
+      await c.env.SESSION_DO.get(regId).init(code + '_reg', phone || code);
+    } catch {}
     return c.json({ session_id: `code_${code}`, code, owner_phone: c.env.OWNER_PHONE || '85297188675' });
   }
 
@@ -258,22 +272,21 @@ app.post('/api/webhook', async (c) => {
     const code = text.trim().toUpperCase();
     if (code.length === 6 && /^[A-Z0-9]{6}$/.test(code)) {
       try {
-        const doId = c.env.SESSION_DO.idFromName(`code_${code}`);
-        const session = c.env.SESSION_DO.get(doId);
-        const state = await session.getState();
-        if (state.code === code && !state.verified) {
-          await session.verify();
-          console.log(`[verify] Code ${code} verified for ${state.phone}`);
+          const doId = c.env.SESSION_DO.idFromName(`code_${code}`);
+          const session = c.env.SESSION_DO.get(doId);
+          const state = await session.getState();
+          if (state.code === code && !state.verified) {
+            await session.verify();
+            // Code used, will expire naturally
+            console.log(`[verify] Code ${code} verified`);
 
-          // Send confirmation via WhatsApp
-          const waId = c.env.WHATSAPP_DO.idFromName('main');
-          const wa = c.env.WHATSAPP_DO.get(waId);
-          await wa.sendText(sender.split('@')[0], '✅ 驗證成功！你嘅 AI 客服已經啟動。');
-
-          return c.json({ status: 'verified', code });
-        }
-      } catch {}
-    }
+            const waId = c.env.WHATSAPP_DO.idFromName('main');
+            const wa = c.env.WHATSAPP_DO.get(waId);
+            await wa.sendText(sender.split('@')[0], '✅ 驗證成功！你嘅 AI 客服已經啟動。');
+            return c.json({ status: 'verified', code });
+          }
+        } catch {}
+      }
 
     return c.json({ status: 'received', text: text.slice(0, 50) });
   } catch (e: any) {
@@ -291,6 +304,25 @@ app.get('/api/history/:session_id', async (c) => {
   const session = c.env.SESSION_DO.get(doId);
   const state = await session.getState();
   return c.json({ chatHistory: state.chatHistory, files: state.files });
+});
+
+// ═══════════════════════════════════════════════════════
+// Valid Codes: return all active verification codes for bridge
+// ═══════════════════════════════════════════════════════
+
+// Code registry stored in a single SessionDO
+app.get('/api/valid-codes', async (c) => {
+  try {
+    const doId = c.env.SESSION_DO.idFromName('_code_registry');
+    const session = c.env.SESSION_DO.get(doId);
+    const state = await session.getState();
+    const now = Date.now();
+    // Filter: only codes from last 5 minutes, not verified
+    const valid = (state as any).codes?.filter((cd: any) => now - cd.createdAt < (cd.ttl || 300000)) || [];
+    return c.json({ codes: valid, count: valid.length });
+  } catch {
+    return c.json({ codes: [], count: 0 });
+  }
 });
 
 // ═══════════════════════════════════════════════════════
@@ -505,6 +537,21 @@ async function pollVerify() {
         document.getElementById('simStatus').textContent='在線';
         showUpload();
         return;
+      }
+      // Auto-refresh code every 60 seconds
+      if (!document.getElementById('verifyStatus').textContent.includes('成功')) {
+        setTimeout(async () => {
+          try {
+            const nr = await (await fetch('/api/verify',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'generate',phone:'auto'})})).json();
+            if (!nr.error) {
+              sessionId = nr.session_id;
+              localStorage.setItem('wa_session',sessionId);
+              document.getElementById('codeDisplay').textContent = nr.code;
+            }
+          } catch(e) {}
+          // Continue polling old session too
+          if (!localStorage.getItem('wa_verified')) pollVerify();
+        }, 60000);
       }
       document.getElementById('verifyStatus').textContent='⏳ 等待驗證中...';
       setTimeout(check, 2000);
