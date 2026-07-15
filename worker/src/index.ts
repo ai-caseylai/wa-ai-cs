@@ -19,9 +19,10 @@ import { Hono } from 'hono';
 import type { Env } from './types';
 import { ConversationDO } from './conversation-do';
 import { WhatsAppDO } from './whatsapp-do';
+import { SessionDO } from './session-do';
 import { ingestDocument, getKBStats, ingestImage } from './rag';
 
-export { ConversationDO, WhatsAppDO };
+export { ConversationDO, WhatsAppDO, SessionDO };
 
 const app = new Hono<{ Bindings: Env }>();
 
@@ -73,6 +74,16 @@ app.post('/api/chat', async (c) => {
   if (!message?.trim()) return c.json({ error: '請輸入訊息' }, 400);
 
   try {
+    // Load chat history from SessionDO
+    let history: { role: string; content: string }[] = [];
+    const sid = phone || 'anonymous';
+    try {
+      const doId = c.env.SESSION_DO.idFromName(sid);
+      const session = c.env.SESSION_DO.get(doId);
+      const state = await session.getState();
+      history = state.chatHistory.map(h => ({ role: h.role as 'user' | 'assistant', content: h.content }));
+    } catch {}
+
     const key = c.env.DEEPSEEK_KEY || '';
     const resp = await fetch('https://api.deepseek.com/v1/chat/completions', {
       method: 'POST',
@@ -81,6 +92,7 @@ app.post('/api/chat', async (c) => {
         model: 'deepseek-chat',
         messages: [
           { role: 'system', content: '你係專業AI客服，用繁體中文簡短回答。如果唔知答案，誠實話俾用戶知。' },
+          ...history.slice(-10),
           { role: 'user', content: message },
         ],
         max_tokens: 800,
@@ -89,6 +101,17 @@ app.post('/api/chat', async (c) => {
     });
     const data = await resp.json() as any;
     const reply = data.choices?.[0]?.message?.content || 'AI 暫時未能回應';
+
+    // Save to SessionDO
+    if (sid !== 'anonymous') {
+      try {
+        const doId = c.env.SESSION_DO.idFromName(sid);
+        const session = c.env.SESSION_DO.get(doId);
+        await session.addChat('user', message);
+        await session.addChat('assistant', reply);
+      } catch {}
+    }
+
     return c.json({ reply });
   } catch (e: any) {
     return c.json({ reply: '⚠️ ' + (e.message || '未知錯誤') }, 500);
@@ -157,6 +180,102 @@ app.post('/api/ingest-image', async (c) => {
 
   const result = await ingestImage(c.env, namespace, title, base64, mimeType);
   return c.json({ ok: true, namespace, title, description: result.description.slice(0, 500), chunks: result.chunks });
+});
+
+// ═══════════════════════════════════════════════════════
+// Verify: generate code + check verification status
+// ═══════════════════════════════════════════════════════
+
+function genCode(): string {
+  const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+  let code = '';
+  for (let i = 0; i < 6; i++) code += chars[Math.floor(Math.random() * chars.length)];
+  return code;
+}
+
+app.post('/api/verify', async (c) => {
+  const { action, phone, session_id } = await c.req.json<{ action: string; phone?: string; session_id?: string }>();
+
+  if (action === 'generate') {
+    if (!phone) return c.json({ error: 'phone required' }, 400);
+    const code = genCode();
+    // Use code as DO id for direct webhook lookup
+    const doId = c.env.SESSION_DO.idFromName(`code_${code}`);
+    const session = c.env.SESSION_DO.get(doId);
+    await session.init(code, phone);
+    return c.json({ session_id: `code_${code}`, code, phone, owner_phone: c.env.OWNER_PHONE || '85297188675' });
+  }
+
+  if (action === 'check') {
+    if (!session_id) return c.json({ error: 'session_id required' }, 400);
+    const doId = c.env.SESSION_DO.idFromName(session_id);
+    const session = c.env.SESSION_DO.get(doId);
+    const state = await session.getState();
+    return c.json({ verified: state.verified, phone: state.phone });
+  }
+
+  return c.json({ error: 'invalid action' }, 400);
+});
+
+// ═══════════════════════════════════════════════════════
+// Webhook: receive WhatsApp messages + auto-verify codes
+// ═══════════════════════════════════════════════════════
+app.post('/api/webhook', async (c) => {
+  try {
+    const body = await c.req.json<any>();
+    const instanceName = body.instanceName || body.instance_name || '';
+    const jsonData = typeof body.jsonData === 'string' ? JSON.parse(body.jsonData) : (body.jsonData || body);
+    const event = jsonData.event || jsonData;
+    const info = event.Info || event.info || {};
+    const msg = event.Message || event.message || {};
+
+    const sender = info.Sender || info.sender || '';
+    const text = msg.conversation || msg.extendedTextMessage?.text || '';
+    const chat = info.Chat || info.chat || '';
+    const isFromMe = info.IsFromMe || info.isFromMe || false;
+    const ownerPhone = c.env.OWNER_PHONE || '85297188675';
+
+    // Only process messages TO the owner, not FROM the owner
+    if (isFromMe) return c.json({ status: 'ignored', reason: 'own_message' });
+    if (!chat.includes(ownerPhone)) return c.json({ status: 'ignored', reason: 'not_owner' });
+
+    // Check if this is a verification code
+    const code = text.trim().toUpperCase();
+    if (code.length === 6 && /^[A-Z0-9]{6}$/.test(code)) {
+      try {
+        const doId = c.env.SESSION_DO.idFromName(`code_${code}`);
+        const session = c.env.SESSION_DO.get(doId);
+        const state = await session.getState();
+        if (state.code === code && !state.verified) {
+          await session.verify();
+          console.log(`[verify] Code ${code} verified for ${state.phone}`);
+
+          // Send confirmation via WhatsApp
+          const waId = c.env.WHATSAPP_DO.idFromName('main');
+          const wa = c.env.WHATSAPP_DO.get(waId);
+          await wa.sendText(sender.split('@')[0], '✅ 驗證成功！你嘅 AI 客服已經啟動。');
+
+          return c.json({ status: 'verified', code });
+        }
+      } catch {}
+    }
+
+    return c.json({ status: 'received', text: text.slice(0, 50) });
+  } catch (e: any) {
+    console.error('[webhook] error:', e.message);
+    return c.json({ status: 'error', error: e.message }, 500);
+  }
+});
+
+// ═══════════════════════════════════════════════════════
+// History: get chat history for a session
+// ═══════════════════════════════════════════════════════
+app.get('/api/history/:session_id', async (c) => {
+  const sid = c.req.param('session_id');
+  const doId = c.env.SESSION_DO.idFromName(sid);
+  const session = c.env.SESSION_DO.get(doId);
+  const state = await session.getState();
+  return c.json({ chatHistory: state.chatHistory, files: state.files });
 });
 
 // ═══════════════════════════════════════════════════════
@@ -263,9 +382,15 @@ h1{font-size:1.6rem;font-weight:700;background:linear-gradient(135deg,#f6821f,#f
 
   <div class="bar">
     <input type="text" id="phone" placeholder="WhatsApp 號碼" value="">
-    <button class="btn btn-go" id="btnSetup" onclick="doSetup()">📱 設定</button>
+    <button class="btn btn-go" id="btnSetup" onclick="doSetup()">📱 取得驗證碼</button>
   </div>
   <div class="status hidden" id="setupStatus"></div>
+  <div id="codeBox" class="hidden" style="width:100%;background:#0a1a0a;border-radius:12px;padding:20px;text-align:center;margin:8px 0;border:1px solid #25D366">
+    <p style="color:#888;font-size:.8rem;margin-bottom:8px">請發送以下驗證碼到 WhatsApp</p>
+    <div style="font-size:2.5rem;font-weight:900;letter-spacing:8px;color:#25D366;font-family:monospace" id="codeDisplay">------</div>
+    <p style="color:#888;font-size:.8rem;margin-top:8px">發送到 <b style="color:#25D366" id="ownerDisplay">+852 9718 8675</b></p>
+    <div class="status wait" id="verifyStatus" style="margin-top:8px">⏳ 等待驗證中...</div>
+  </div>
 
   <div id="uploadSection" class="hidden upload">
     <div class="upload-zone" onclick="document.getElementById('fileInput').click()">📄 上載 PDF</div>
