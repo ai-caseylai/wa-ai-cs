@@ -213,13 +213,12 @@ app.post('/api/verify', async (c) => {
   const { action, phone, session_id } = await c.req.json<{ action: string; phone?: string; session_id?: string }>();
 
   if (action === 'generate') {
-    if (!phone) return c.json({ error: 'phone required' }, 400);
     const code = genCode();
     // Use code as DO id for direct webhook lookup
     const doId = c.env.SESSION_DO.idFromName(`code_${code}`);
     const session = c.env.SESSION_DO.get(doId);
-    await session.init(code, phone);
-    return c.json({ session_id: `code_${code}`, code, phone, owner_phone: c.env.OWNER_PHONE || '85297188675' });
+    await session.init(code, phone || code);
+    return c.json({ session_id: `code_${code}`, code, owner_phone: c.env.OWNER_PHONE || '85297188675' });
   }
 
   if (action === 'check') {
@@ -227,7 +226,7 @@ app.post('/api/verify', async (c) => {
     const doId = c.env.SESSION_DO.idFromName(session_id);
     const session = c.env.SESSION_DO.get(doId);
     const state = await session.getState();
-    return c.json({ verified: state.verified, phone: state.phone });
+    return c.json({ verified: state.verified, phone: state.phone || state.code });
   }
 
   return c.json({ error: 'invalid action' }, 400);
@@ -396,17 +395,24 @@ h1{font-size:1.6rem;font-weight:700;background:linear-gradient(135deg,#f6821f,#f
   <h1>🤖 WhatsApp AI 客服</h1>
   <p class="sub">Cloudflare Workers · Vectorize · DeepSeek</p>
 
-  <div class="bar">
-    <input type="text" id="phone" placeholder="WhatsApp 號碼" value="">
-    <button class="btn btn-go" id="btnSetup" onclick="doSetup()">📱 取得驗證碼</button>
-  </div>
-  <div class="status hidden" id="setupStatus"></div>
-  <div id="codeBox" class="hidden" style="width:100%;background:#0a1a0a;border-radius:12px;padding:16px;text-align:center;border:1px solid #25D366">
-    <p style="color:#888;font-size:.8rem;margin-bottom:6px">請發送以下驗證碼到 WhatsApp</p>
-    <div style="font-size:2.2rem;font-weight:900;letter-spacing:6px;color:#25D366;font-family:monospace" id="codeDisplay">------</div>
-    <p style="color:#888;font-size:.8rem;margin-top:6px">發送到 <b style="color:#25D366" id="ownerDisplay">+852 9718 8675</b></p>
+  <div id="codeBox" class="hidden" style="width:100%;background:#0a1a0a;border-radius:12px;padding:20px;text-align:center;border:1px solid #25D366">
+    <p style="color:#888;font-size:.85rem;margin-bottom:8px">請發送以下驗證碼到 WhatsApp</p>
+    <div style="font-size:3rem;font-weight:900;letter-spacing:10px;color:#25D366;font-family:monospace" id="codeDisplay">------</div>
+    <p style="color:#888;font-size:.85rem;margin-top:8px">發送到 <b style="color:#25D366">+852 9718 8675</b></p>
+    <p style="color:#666;font-size:.75rem;margin-top:4px">發送後網頁會自動驗證</p>
     <div class="status wait" id="verifyStatus">⏳ 等待驗證中...</div>
   </div>
+  <div id="verifiedBox" class="hidden" style="width:100%;background:#0a1a0a;border-radius:12px;padding:16px;text-align:center;border:1px solid #25D366">
+    <p style="color:#25D366;font-weight:700;font-size:1.1rem">✅ 驗證成功！</p>
+    <p style="color:#888;font-size:.85rem;margin-top:4px" id="verifiedPhone"></p>
+  </div>
+  <div class="upload" id="uploadSection" class="hidden">
+    <div class="upload-zone" onclick="document.getElementById('fileInput').click()">📄 上載 PDF</div>
+    <input type="file" id="fileInput" accept=".pdf" class="hidden" onchange="handleFile(this.files)">
+    <button class="btn btn-go" id="btnIngest" onclick="doIngest()" disabled>📚 加入</button>
+  </div>
+  <div class="prog hidden" id="prog"><div class="prog-fill" id="progFill"></div></div>
+
 
 
   <div id="uploadSection" class="hidden upload">
@@ -423,7 +429,7 @@ h1{font-size:1.6rem;font-weight:700;background:linear-gradient(135deg,#f6821f,#f
     </div>
     <div class="phone-bd">
       <div class="chat-msgs" id="chatMsgs">
-        <div class="msg ai">你好！我係 AI 客服助手 👋<br>輸入號碼開始設定，然後喺度測試</div>
+        <div class="msg ai">你好！我係 AI 客服助手 👋<br>發送上面驗證碼到 WhatsApp 即可開始</div>
       </div>
       <div class="chat-in">
         <input type="text" id="chatInput" placeholder="輸入訊息..." onkeydown="if(event.key==='Enter')sendMsg()">
@@ -436,8 +442,29 @@ h1{font-size:1.6rem;font-weight:700;background:linear-gradient(135deg,#f6821f,#f
 <script>
 let phone = localStorage.getItem('wa_phone') || '';
 let setupDone = localStorage.getItem('wa_setup') === 'true';
-if (phone) { document.getElementById('phone').value = phone; }
-if (setupDone) { showUpload(); document.getElementById('btnSetup').textContent='✅ 已設定'; document.getElementById('btnSetup').disabled=true; document.getElementById('simStatus').textContent='在線 — '+phone; }
+// Auto-generate verification code on page load
+(async function init() {
+  if (localStorage.getItem('wa_verified') === 'true') {
+    document.getElementById('codeBox').classList.add('hidden');
+    document.getElementById('verifiedBox').classList.remove('hidden');
+    document.getElementById('verifiedPhone').textContent = '已驗證: ' + (localStorage.getItem('wa_phone') || '');
+    document.getElementById('uploadSection').classList.remove('hidden');
+    document.getElementById('simStatus').textContent='在線';
+  } else {
+    // Generate code immediately
+    try {
+      const r = await (await fetch('/api/verify',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'generate',phone:'auto'})})).json();
+      if (!r.error) {
+        sessionId = r.session_id; phone = r.code;
+        localStorage.setItem('wa_session',sessionId);
+        document.getElementById('codeBox').classList.remove('hidden');
+        document.getElementById('codeDisplay').textContent = r.code;
+        document.getElementById('simStatus').textContent='等待驗證';
+        pollVerify();
+      }
+    } catch(e) { document.getElementById('codeDisplay').textContent = 'ERROR'; }
+  }
+})();
 
 function showUpload() {
   document.getElementById('uploadSection').classList.remove('hidden');
@@ -470,9 +497,12 @@ async function pollVerify() {
       const r = await (await fetch('/api/verify',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'check',session_id:sessionId})})).json();
       if (r.verified) {
         localStorage.setItem('wa_setup','true');
-        document.getElementById('verifyStatus').className='status ok';
-        document.getElementById('verifyStatus').textContent='✅ 驗證成功！AI 客服已啟動';
-        document.getElementById('simStatus').textContent='在線 — '+phone;
+        localStorage.setItem('wa_verified','true');
+        localStorage.setItem('wa_phone', r.phone || phone);
+        document.getElementById('codeBox').classList.add('hidden');
+        document.getElementById('verifiedBox').classList.remove('hidden');
+        document.getElementById('verifiedPhone').textContent = '已驗證: ' + (r.phone || '');
+        document.getElementById('simStatus').textContent='在線';
         showUpload();
         return;
       }
