@@ -8,7 +8,7 @@ import type { Env, DocChunk, ChatResponse } from './types';
 // Embedding: DashScope text-embedding-v4
 // ═══════════════════════════════════════════════════════
 async function getEmbedding(text: string, env: Env): Promise<number[]> {
-  const key = env.DASHSCOPE_API_KEY || '';
+  const key = env.DASHSCOPE_KEY || '';
   const resp = await fetch(
     'https://dashscope-intl.aliyuncs.com/compatible-mode/v1/embeddings',
     {
@@ -29,7 +29,7 @@ async function chatCompletion(
   env: Env,
   opts?: { maxTokens?: number; temperature?: number }
 ): Promise<string> {
-  const key = env.DEEPSEEK_API_KEY || '';
+  const key = env.DEEPSEEK_KEY || '';
   const resp = await fetch('https://api.deepseek.com/v1/chat/completions', {
     method: 'POST',
     headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json' },
